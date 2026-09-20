@@ -1,0 +1,284 @@
+# Provider Configuration
+
+Every model provider lives at `[providers.models.<type>.<alias>]`. `<type>` is a canonical family slot (see the [Catalog](./catalog.md#all-slots) for every slot with its endpoint). `<alias>` is your operator-assigned instance name, pick any descriptive name (`home`, `work`, `cn`, `gpt5`, ...).
+
+## Minimal working example
+
+The smallest config that loads clean has four section headers: a provider entry, an agent that references it, and a risk profile the agent gates against. Configure them through the gateway, zerocode, or `zeroclaw config set`; the [config reference](../reference/config.md#providers) has the full field index.
+
+## Field reference: provider entry
+
+Almost every family also takes the shared fields from `ModelProviderConfig`:
+
+- `api_key`: credential for providers that use bearer or subscription-style API keys.
+- `uri`: full endpoint override. Leave unset to use the family's endpoint resolver.
+- `model`: model identifier sent to the provider.
+- `temperature`: optional sampling temperature.
+- `timeout_secs`: HTTP request timeout in seconds.
+- `max_tokens`: optional response length cap.
+- `extra_headers`: extra HTTP headers for custom gateways or auth bridges.
+- `fallback_models`: alternate model IDs on the same provider alias.
+- `fallback`: ordered list of other dotted provider aliases to try after this alias fails.
+- `wire_api`, `native_tools`, `provider_extra`, `think`, and `chat_template_kwargs`: advanced protocol and request-body overrides.
+- `vision`: override the provider's image-input (vision) capability. Leave unset to use the family's built-in default. Set `false` for a text-only model served by a vision-capable family (for example, a text model behind llama.cpp) so image messages route to a configured `[multimodal] vision_model_provider` instead of erroring; set `true` to force it on.
+- `tool_result_image_policy`: handling for image markers in native `role = "tool"` results sent to compatible chat-completions providers. Defaults to `"image_url"`; set to `"omit"` to remove image URI/base64 payloads and append a fixed notice. This does not change direct user images or OpenAI Responses providers.
+- `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
+
+Family-specific entries add their own typed fields on top of these shared fields.
+
+## Field resolution order
+
+For most families, the URL is resolved in this order:
+
+1. **Operator override**: `uri` field on the alias entry, if set.
+2. **Family endpoint**: the family's `*Endpoint` enum supplies the URL (e.g. `OpenAIEndpoint::Default` -> `https://api.openai.com/v1`). Multi-region families have an `endpoint` field on the alias entry that picks the variant (e.g. `endpoint = "cn"` for Moonshot).
+3. **Templated families**: Azure takes typed inputs (`resource`, `deployment`, `api_version`) and substitutes them into the family's URI template. Missing fields fail loud at runtime.
+
+Bedrock is an exception: its endpoint hostname is constructed at request time from the signing region resolved through the AWS credential chain (`AWS_REGION`, `AWS_DEFAULT_REGION`, or the `region` from the active `credential_process` or IMDS profile). The `uri` alias field and the schema-level `providers.models.bedrock.<alias>.region` field have no effect in the current implementation.
+
+## Family slots
+
+Every slot, its default endpoint, and whether it runs locally is in the [Catalog](./catalog.md#all-slots). There is one canonical key per vendor: no synonyms.
+
+## Credentials
+
+Supported credential input and storage forms:
+
+1. **Inline `api_key = "..."`** in the alias entry (fine for dev, risky for checked-in configs).
+2. **1Password references**: set a secret field to `op://vault/item/field`. ZeroClaw keeps the reference in config and resolves it at runtime with `op read`, so the 1Password CLI must be installed and signed in.
+3. **Config-level secrets store**: encrypted at `~/.zeroclaw/secrets` via a local key file.
+4. **Generic env override**: `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` sets `providers.models.<type>.<alias>.api_key` at startup. See [Environment variables](../reference/env-vars.md) for the full grammar.
+
+Schema-mirror env overrides win at startup. They replace the in-memory credential for that process without rewriting the stored inline, encrypted, or `op://` value on disk.
+
+`zeroclaw quickstart` writes credentials to the secrets store by default. Configs you commit should not contain inline keys. For ecosystem-default names you already export in your shell (`$ANTHROPIC_API_KEY`, `$OPENROUTER_API_KEY`, …), the [env-vars reference](../reference/env-vars.md#bridging-ecosystem-default-env-vars) shows the one-line bash expansions that point a schema-mirror name at the existing value.
+
+## OAuth and subscription auth
+
+Several providers accept OAuth or subscription-style tokens instead of raw API keys. Get the token from the vendor's own dashboard or CLI flow, then drop it into the alias entry the same way you would an API key:
+
+- **Anthropic / Claude**: Console API keys and tokens generated by `claude setup-token` for Claude Max go in `api_key` on `[providers.models.anthropic.<alias>]`. In Quickstart, pick `api_key` or `setup_token`; the saved provider entry is still the canonical `anthropic` slot.
+- **OpenAI Codex subscription**: run `zeroclaw auth login --model-provider openai-codex` (or import an existing Codex CLI login with `--import ~/.codex/auth.json`), then set `requires_openai_auth = true` and leave `api_key` unset on `[providers.models.openai.<alias>]`; the runtime reads ZeroClaw's stored `openai-codex` auth profile.
+- **Gemini CLI**: `[providers.models.gemini_cli.<alias>]` shells out to the `gemini` CLI; use the CLI's own auth flow.
+- **Grok Build CLI**: `[providers.models.grok_cli.<alias>]` shells out through the documented `grok agent stdio` ACP surface. The assembled prompt is JSON-RPC on stdin, never argv or a prompt file. Auth uses the CLI login cache by default. For API-key auth, export `XAI_API_KEY` into the daemon environment and explicitly add `env_passthrough = ["XAI_API_KEY"]` to the alias; the typed alias `api_key` remains unsupported. An existing absolute `working_directory` is required and defines both the child cwd and ACP session boundary. The child environment is cleared before spawn, and `env_passthrough` defaults to empty. Other provider-owned `XAI_*` names and all `GROK_*` names are rejected. ZeroClaw defaults to `--sandbox strict`, `--permission-mode dontAsk`, an empty built-in tool set, and fail-closed ACP permission responses. `extra_args` is the explicit per-alias opt-in for relaxing those controls. The bypass flags `--always-approve`, `--dangerously-skip-permissions`, `--yolo`, and `--permission-mode=bypassPermissions` make the headless ACP client select `allow_once`; other permission modes continue to select `reject_once`. ACP transport/model/session/cwd flags plus positional and short arguments are reserved; unknown value-taking long options use `--flag=value`. Alias `vision = true` only opts ZeroClaw into sending ACP image blocks; Grok still advertises `promptCapabilities.image = false` through 0.2.118 and does not reliably use the image content - leave unset for production; see [ACP vision / image input](./catalog.md#acp-vision--image-input-current-grok-build-behavior).
+- **Qwen / MiniMax**: set `auth_mode = "o_auth"` on the alias entry plus the relevant `oauth_*` fields (see [env-vars → OAuth and CLI-path fields](../reference/env-vars.md#oauth-and-cli-path-fields)).
+
+## Container-friendly overrides
+
+When ZeroClaw runs inside a container and a provider is on the host (e.g. Ollama), set `uri` to a host-reachable address. The generic env-override mechanism (`ZEROCLAW_<dotted_path_with_double_underscores>=<value>`) can set the same field at runtime without editing config:
+
+{{#env-var container}}
+
+The `__` is the path separator; the example above sets `providers.models.ollama.home.uri`. See [Environment variables](../reference/env-vars.md) for the full grammar.
+
+## Per-model vision capability
+
+Use `vision` when a provider family can serve both multimodal and text-only
+models. The value belongs to the provider alias, so routing and fallback paths
+resolve it together with that alias's endpoint, credentials, and model:
+
+```toml
+[providers.models.openai.vision]
+model = "gpt-4o"
+wire_api = "responses"
+vision = true
+
+[providers.models.llamacpp.text]
+model = "qwen3-4b"
+vision = false
+```
+
+Leaving `vision` unset preserves the provider family's built-in default. For
+OpenAI Responses aliases, set `vision = true` for models that accept image
+input; this opt-in keeps text-only Responses models from receiving image
+payloads accidentally.
+
+Setting `vision = true` is an explicit operator assertion that the selected
+alias accepts image input. It changes image routing: ZeroClaw keeps image
+attachments on that alias instead of treating it as text-only or routing them
+to `multimodal.vision_model_provider`. Set it only for a tested provider and
+model combination. For `grok_cli`, the same field only controls whether
+ZeroClaw **sends** ACP image blocks; it does not rewrite Grok's
+`promptCapabilities.image` advertise (still `false` through 0.2.118) and does
+not make the CLI reliably describe the image. See
+[ACP vision / image input](./catalog.md#acp-vision--image-input-current-grok-build-behavior).
+
+When `[multimodal] vision_model_provider` names a dotted provider alias, its
+`model` is used automatically. An explicit `[multimodal] vision_model` takes
+precedence over the alias model; if neither is set, the primary turn model is
+used for backward compatibility.
+
+## Native thinking display (Anthropic)
+
+`agent.thinking.display` controls how Anthropic extended thinking is
+delivered when native thinking is enabled (`agent.thinking.native_thinking
+= true`). Accepted values:
+
+- `off` (default): no `display` field is sent; requests are byte-identical
+  to earlier ZeroClaw versions and thinking requests use the non-streaming
+  fallback.
+- `omitted`: Anthropic omits thinking text from the response; blocks arrive
+  signature-only (empty `thinking`, required signature), keeping replay
+  intact while minimizing visible reasoning.
+- `updates`: the request carries the
+  `thinking-display-updates-2026-08-18` beta and uses the streaming
+  response path. Readable thinking progress is surfaced live while the
+  model works; the signed reasoning payload is retained separately for
+  history replay and never shown.
+- `summarized`: same streaming behavior, requesting summarized thinking.
+
+```toml
+[agent.thinking]
+native_thinking = true
+display = "updates"
+```
+
+The setting requires an Anthropic account enrolled in the
+`thinking-display-updates` beta; without enrollment the API rejects the
+request. Set `display = "off"` (or remove the field) to return to the
+previous wire behavior.
+
+## Per-family knobs: worked examples
+
+### Ollama
+
+Ollama defaults to the local endpoint, so a local alias only needs the model name:
+
+```toml
+[providers.models.ollama.local]
+model = "llama3.1"
+```
+
+Set `uri` when ZeroClaw is not running on the same host as Ollama:
+
+```toml
+[providers.models.ollama.host]
+model = "llama3.1"
+uri = "http://host.docker.internal:11434"
+```
+
+Ollama-specific optional fields are `num_ctx`, `num_predict`, and `temperature_override`.
+
+### Azure OpenAI
+
+Azure OpenAI computes its endpoint from the typed Azure fields:
+
+```toml
+[providers.models.azure.work]
+api_key = "op://platform/azure-openai/api-key"
+model = "gpt-4o"
+resource = "example-resource"
+deployment = "gpt-4o-prod"
+api_version = "2024-10-21"
+```
+
+The `resource`, `deployment`, and `api_version` values live in this typed config, they are not read from Azure-specific environment variables. Use `uri` only when you need to override the computed endpoint completely.
+
+### Amazon Bedrock
+
+Bedrock needs an alias with a model; endpoint region currently comes from the Bedrock auth environment/profile path:
+
+```toml
+[providers.models.bedrock.work]
+model = "anthropic.claude-sonnet-4-6"
+```
+
+The Bedrock provider uses the credential paths implemented in `crates/zeroclaw-providers/src/bedrock.rs`:
+
+1. `api_key` on the Bedrock alias, or `BEDROCK_API_KEY`, uses Bedrock bearer-token auth and takes precedence over SigV4 credentials.
+2. `AWS_ACCESS_KEY_ID` plus `AWS_SECRET_ACCESS_KEY` uses SigV4. `AWS_SESSION_TOKEN` is optional. `AWS_REGION` or `AWS_DEFAULT_REGION` selects the signing region and falls back to `us-east-1`.
+3. `credential_process` in the active profile from `~/.aws/config`, or from `AWS_CONFIG_FILE`, uses SigV4. `AWS_PROFILE` selects the profile and defaults to `default`.
+4. EC2 IMDSv2 instance credentials are the final SigV4 fallback.
+
+The config schema additionally defines a `providers.models.bedrock.<alias>.region`
+field, but the current implementation does not read it. The endpoint region is
+always resolved from the AWS credential chain (environment variables,
+`credential_process`, or IMDS) as described above.
+
+A normal static profile in `~/.aws/credentials` is not read by the current Bedrock implementation. `~/.zeroclaw/secrets` only stores ZeroClaw config secrets such as an alias `api_key`; it does not export `AWS_*` variables for the provider.
+
+To reuse an AWS CLI profile through the implemented profile path, put a `credential_process` in `~/.aws/config`:
+
+```ini
+[profile zeroclaw-bedrock]
+credential_process = /usr/bin/aws configure export-credentials --profile my-existing-profile
+region = us-east-1
+```
+
+`/usr/bin/aws` is the default path on Debian and Ubuntu. On other systems,
+use the absolute path from `command -v aws`.
+
+Then run ZeroClaw with `AWS_PROFILE=zeroclaw-bedrock`. For a systemd user service, see [Service management](../setup/service.md#environment-overrides-systemd).
+
+### Multi-region (Moonshot / Qwen / GLM / MiniMax / ...)
+
+One type per family; pick the region via the typed `endpoint` field on the alias entry.
+
+### Custom OpenAI-compatible endpoint
+
+The `custom` slot requires `uri`. See [Custom providers](./custom.md).
+
+## Picking which provider an agent uses
+
+Agents reference a provider by dotted alias. Provider entries on their own do nothing.
+
+`risk_profile` and `runtime_profile` reference independent alias maps, so their names need not match (`runtime_profile` is also optional). `Config::validate()` fails loud at startup if `model_provider` doesn't resolve to a configured `[providers.models.<type>.<alias>]` entry, or if `risk_profile` doesn't resolve to a configured `[risk_profiles.<alias>]` entry.
+
+For multiple agents pointing at different providers, see [Routing](./routing.md).
+
+## Fallback on failure
+
+When a request to a provider fails after exhausting its retries (provider down,
+key rate-limited, model unavailable), the alias can fall over to alternatives
+you declare on the alias entry. Two independent, ordered axes:
+
+- **`fallback_models`**: alternate model IDs tried on *this* provider, using the
+  same endpoint, key, and headers. Only the model identifier changes. Use it when
+  a provider serves a backup model (a smaller or older variant) that should be
+  tried before leaving the provider entirely.
+- **`fallback`**: an ordered list of *other* provider aliases (dotted
+  `<type>.<alias>` references into `[providers.models]`). Each fallback alias
+  resolves with **its own** credentials, endpoint, and model, a fallback never
+  inherits the failing alias's key.
+
+### Order of attempts
+
+The walk is depth-first: an alias's entire model list is exhausted before leaving
+it, then each `fallback` alias is descended in turn, applying that alias's own
+`fallback_models` and `fallback` recursively. Suppose `anthropic.prod` serves
+`claude-sonnet-4-5`, lists `claude-haiku-4-5` in its `fallback_models`, and
+names `openai.backup` (serving `gpt-4.1`) in its `fallback`. The attempt order
+is then:
+
+```
+anthropic.prod/claude-sonnet-4-5
+  -> anthropic.prod/claude-haiku-4-5
+  -> openai.backup/gpt-4.1
+  -> (request fails)
+```
+
+Fallback aliases can themselves declare `fallback`, so the chain is as long as
+your config makes it, up to a maximum depth of **3 aliases**. A chain that loops
+back on itself (`a` -> `b` -> `a`) is detected and the cycle edge is pruned, and
+an acyclic chain deeper than the limit has its remaining links pruned; neither
+ever loops, hangs, or overflows the stack.
+
+### Misconfiguration
+
+A `fallback` entry that names an alias which is not configured, one that closes a
+cycle, or a chain that exceeds the maximum depth is **non-fatal**:
+`Config::validate()` still succeeds, the offending edge is skipped at runtime, and
+the issue is surfaced as a validation warning (`dangling_fallback_ref` /
+`fallback_cycle` / `max_fallback_depth_exceeded`) on the CLI and in the dashboard.
+A `fallback_models` entry that is blank or duplicates the alias's primary `model`
+is likewise skipped at runtime and surfaced (`empty_fallback_model` /
+`fallback_model_duplicates_primary`). A bad fallback link degrades gracefully, it
+never prevents the agent from running.
+
+## See also
+
+- [Overview](./overview.md)
+- [Provider catalog](./catalog.md): concrete config example for every family
+- [Streaming](./streaming.md)
+- [Routing](./routing.md)
+- [Custom providers](./custom.md)

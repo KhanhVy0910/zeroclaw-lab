@@ -1,0 +1,268 @@
+# MCP
+
+ZeroClaw is an MCP client: it connects to external [Model Context Protocol](https://modelcontextprotocol.io) servers and exposes their tools to the agent. Each MCP tool is namespaced as `<server>__<tool>` (for example `filesystem__read_file`), so tools from different servers never collide.
+
+## Configure MCP
+
+MCP support is enabled by default, but no external MCP tools are exposed until at least one server is configured under `mcp.servers` and an agent is granted that server through its `mcp_bundles` (see Per-agent server scoping below). Configure through the gateway, zerocode, or `zeroclaw config set`:
+
+```sh
+zeroclaw config set mcp.servers.filesystem.command npx
+```
+
+Set `mcp.enabled = false` to disable MCP tool loading without removing server definitions.
+
+## Per-agent server scoping (`mcp_bundles`)
+
+A `[[mcp.servers]]` entry only *defines* a server. Which servers an agent actually connects to is decided by that agent's `agents.<alias>.mcp_bundles`, and the model is secure by default: omission is not a grant.
+
+- An agent with no `mcp_bundles` connects to **no** MCP servers, even when `mcp.servers` is non-empty.
+- A bundle `[mcp_bundles.<alias>]` names the servers it grants by their `mcp.servers` `name`, with an optional `exclude` list. An agent's grant is the union of the servers across every bundle it references, minus any name excluded by any of those bundles (deny wins).
+- An unknown bundle alias, or a bundle server name that matches no configured server, grants nothing. Both fail closed and are reported as non-fatal warnings by config validation, so a typo narrows an agent's access instead of widening it.
+
+```toml
+[[mcp.servers]]
+name = "filesystem"
+command = "npx"
+
+[mcp_bundles.files]
+servers = ["filesystem"]
+
+[agents.assistant]
+mcp_bundles = ["files"]   # connects to `filesystem`; an agent without this gets no MCP servers
+```
+
+- Bundle changes take effect on **session restart**. The resolver (`Config::mcp_servers_for_agent`) runs at session/agent construction time; editing `[mcp_bundles.*]` or `agents.<alias>.mcp_bundles` while a session is live does not change that session's connected servers. End and restart the affected sessions to pick up new grants.
+
+This is the *connection* boundary (which servers an agent talks to at all). The `allowed_tools` / `excluded_tools` controls below are the per-tool *capability* boundary applied on top of whatever a granted server exposes.
+
+## Transports
+
+A server is reached over one of three transports (the `transport` field):
+
+| Transport | When to use | Required fields |
+|---|---|---|
+| `stdio` (default) | A local process you spawn (a Node.js or Python MCP server) | `command`, optional `args`, `env` |
+| `http` | A remote server speaking MCP over HTTP POST | `url`, optional `headers` |
+| `sse` | A remote server speaking MCP over HTTP + Server-Sent Events | `url`, optional `headers` |
+
+`env` (stdio) and `headers` (http/sse) are stored as secrets; `headers` commonly carries the `Authorization: Bearer …` token for the upstream server.
+
+Add a server through the gateway, zerocode, or `zeroclaw config set` (for example `zeroclaw config set mcp.servers.filesystem.command npx`). A stdio server needs `command` plus optional `args`/`env`; an http/sse server needs `url` plus optional `headers`. The per-field commands are in the field table below.
+
+### Example: Parallel Search
+
+[Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp)
+provides public web search and page extraction without a Parallel account or API
+key. Free access is rate limited. Its Streamable HTTP endpoint uses ZeroClaw's
+`http` transport:
+
+```toml
+[[mcp.servers]]
+name = "parallel"
+transport = "http"
+url = "https://search.parallel.ai/mcp"
+
+[mcp_bundles.web]
+servers = ["parallel"]
+
+[agents.assistant]
+mcp_bundles = ["web"]
+```
+
+Merge these entries into your existing `config.toml`, using the alias of the
+agent you want to grant access. Add `"web"` to that agent's existing
+`mcp_bundles` list rather than replacing its other grants. If the `web` bundle
+already exists, add `"parallel"` to its `servers` list. Keep `mcp.enabled = true`
+and restart the affected session after changing grants.
+
+The agent can then use `parallel__web_search` and `parallel__web_fetch`, subject
+to its normal tool authorization and approval policy. Calls send queries,
+requested URLs, and any supplied objective or context to Parallel. Once granted
+access, the agent may choose these tools during its work. To revoke access,
+remove `"parallel"` from every bundle granted to that agent, or add it to a
+granted bundle's `exclude` list, then restart the session.
+
+## Editing servers
+
+Three surfaces edit the same `[[mcp.servers]]` table:
+
+- **`config.toml`**: hand-edit the keys documented below. The full table is round-tripped on save.
+- **zerocode TUI** (`/config` -> `mcp.servers`): first-class per-field editor. The section shows one row per server, labeled with the server's `name`; enter a row to edit `transport`, `command` / `url`, `headers`, `env`, and `tool_timeout_secs` as individual fields. `+ Add` creates a new entry seeded with the name you supply; deleting from the alias list removes the entry. The `name` field is not edited inline because renaming the natural key mid-edit would invalidate in-flight references; use the dashboard or hand-edit `config.toml` to rename for now.
+- **Web dashboard**: currently renders `mcp.servers` through a JSON-array editor. A migration to the same per-field surface the TUI uses is planned; until then the dashboard remains a usable but coarser editor.
+
+## Server fields
+
+Per-server fields (`[[mcp.servers]]`), generated from the schema:
+
+{{#config-fields mcp.servers}}
+
+`tool_timeout_secs` is an optional per-call timeout; it must be greater than 0 and is capped at 600 seconds.
+
+### Custom CA trust
+
+For an HTTP or SSE server whose certificate is issued by a private CA, set
+`tls_ca_cert_path` to an absolute path containing one or more PEM-encoded CA
+certificates. The configured certificates are added to the default trust store;
+certificate-chain, expiry, and hostname verification remain enabled.
+
+A relative, missing, unreadable, empty, oversized, non-regular, or invalid CA
+file is a hard connection error for that server. The path must resolve to a
+regular file no larger than 1 MiB. Symlinks are followed, so certificate
+rotation and mounted-secret layouts that publish the bundle through a symlink
+work as configured; the resolved file is validated after it is opened, and a
+symlink that resolves to a directory, device, or FIFO is rejected. ZeroClaw
+never disables verification or silently
+falls back when this field is set. The configured server URL and any message
+endpoint advertised by an SSE server must use `https://`; plaintext URLs and
+downgrade redirects are rejected before request headers or content are sent.
+The value is applied when the MCP session starts; restart the affected session
+after changing it. Remove the field and restart the session to return to the
+default trust store. Stdio servers ignore it.
+
+## Top-level fields
+
+{{#config-fields mcp}}
+
+## Deferred loading
+
+`mcp.deferred_loading` is `false` by default, so configured MCP tools are included in the model context eagerly. Set it to `true` to place only MCP tool **names** in the system prompt; the LLM calls the built-in `tool_search` tool to fetch a tool's full schema before invoking it. This keeps the initial context window small when a server exposes many tools.
+
+## Security and approval
+
+MCP tool calls go through the same approval gate as every other tool, governed by the agent's risk profile (`risk_profiles.<alias>`). The `tool_search` discovery step is auto-approved so deferred MCP loading can work in non-interactive sessions, but tools discovered from MCP servers still follow the normal approval policy:
+
+- At autonomy `level = full`, no tool call prompts (MCP tools included).
+- Otherwise, an MCP tool call prompts for approval unless its **prefixed** name (`<server>__<tool>`) is in the profile's `auto_approve` list. `auto_approve = ["*"]` approves everything; an exact entry like `auto_approve = ["filesystem__read_file"]` approves just that tool.
+- `always_ask` is the inverse: a name (or `"*"`) there always prompts, overriding `auto_approve`.
+
+### Authorization: `allowed_tools` / `excluded_tools`
+
+Approval gates *when* a tool call needs a human green-light. Authorization gates *whether* the agent can call a tool at all. The two are independent.
+
+Keep the three MCP tool controls on their own axes:
+
+| Control | Scope | Use it for |
+|---|---|---|
+| `tool_filter_groups` | Prompt/context exposure | Decide which MCP tool schemas are visible to the model for a turn. |
+| `auto_approve` / `always_ask` | Approval policy | Decide whether a selected MCP tool call requires operator approval. |
+| `allowed_tools` / `excluded_tools` | Capability policy | Decide which prefixed tool names the risk profile may use at all. |
+
+For runtime-discovered MCP tools the capability contract has an MCP-specific exception:
+
+- If the risk profile's `allowed_tools` is empty or omitted, no authorization constraint applies; every discovered tool (MCP or built-in) is reachable. The TOML config does not distinguish an omitted field from `allowed_tools = []`; both deserialize to the same "no authorization constraint" state at the risk-profile level. If you need an explicit deny-all gate, do it on the caller-supplied per-run `allowed_tools` (cron jobs and other narrowers pass that list in directly) or via `excluded_tools` covering the specific tools you want blocked.
+- If `allowed_tools` is non-empty, any MCP tool whose name contains `__` (the `<server>__<tool>` convention) is auto-admitted into the effective allow-list without being listed there individually. Non-MCP built-ins still need an exact entry.
+- `excluded_tools` always subtracts, including from the auto-admitted MCP set. To block a single MCP tool like `filesystem__write_file` while keeping the rest of the `filesystem` server reachable, put it in `excluded_tools`.
+
+The rationale: before this exception, every agent that pinned an `allowed_tools` list to lock down its built-in surface would silently lose every MCP tool, even ones the operator explicitly configured. The cost is that the deny-list is now the operator's primary lever for blocking destructive MCP capabilities under an allow-list-pinned profile.
+
+If you want the strict pattern from before this change, where you only admit MCP tools you list explicitly with no `__` auto-admit, combine an explicit `allowed_tools` entry with an `excluded_tools` entry per destructive sibling you need blocked:
+
+```toml
+[risk_profiles.assistant]
+allowed_tools = [
+  "file_read",
+  "filesystem__read_file",
+]
+# Block the destructive sibling that would otherwise be auto-admitted via
+# the `__` exception above.
+excluded_tools = [
+  "filesystem__write_file",
+]
+auto_approve = [
+  "filesystem__read_file",
+]
+```
+
+The MCP `__` auto-admit exception is scoped to the **risk profile**'s `allowed_tools` only. Caller-supplied per-run allow-lists, like a cron job `allowed_tools` or any other narrowed invocation that passes an explicit list into the runtime, are still treated as strict explicit-list intersections, with no `__` auto-admit on top. A cron job that narrows itself to `allowed_tools = ["cron_add"]` will not surface `filesystem__write_file` to the model even when the agent's risk profile would otherwise auto-admit it via the `__` convention; the per-run narrowing remains a reliable capability boundary regardless of how many MCP servers are configured.
+
+`auto_approve` alone does not hide a tool from the model; it only answers the approval question after the model selects that tool. Use `tool_filter_groups` to reduce prompt noise and `allowed_tools` / `excluded_tools` to enforce a capability boundary.
+
+See [Autonomy levels](../security/autonomy.md) for the full per-profile field surface, and the [Config reference](../reference/config.md#mcp) for every MCP field and default.
+
+## MCP Resources and Prompts
+
+In addition to MCP **tools**, ZeroClaw exposes MCP **resources** and **prompts**
+from connected servers.
+
+### Tools
+
+Two built-in tools are available (subject to your agent's tool access policy):
+
+- `mcp_resources`: `action: "list"` (optional `server`, `cursor`) lists
+  resources; `action: "read"` with `uri` (prefixed `<server>__<uri>`) returns
+  contents.
+- `mcp_prompts`: `action: "list"` lists prompts; `action: "get"` with `name`
+  (prefixed `<server>__<name>`) and optional `arguments` returns the rendered
+  prompt messages.
+
+Servers that do not advertise resource/prompt capabilities are skipped, and calls
+against them return a clear "does not support" error.
+
+### Pinning resources into context
+
+Each MCP server entry accepts an optional `pinned_resources` field: a list of
+resource URIs to read once at startup and inject into the system prompt. Set it
+through the same config surfaces used to define the server (the gateway, zerocode,
+or `zeroclaw config set`, as shown under [Configure MCP](#configure-mcp)), naming
+the resources you want the agent to always have on hand. The field defaults to
+empty, so servers without it are unaffected.
+
+Pinned content is read once per run (no live refresh) and is labeled
+`trust="untrusted-external"` so the model treats it as data, not instructions.
+
+### Embedded resource blobs in tool results
+
+When an MCP `tools/call` result includes a content item shaped as
+`type: "resource"` with a nested `blob` (base64), ZeroClaw does **not** dump that
+base64 into the model context. Instead it materializes the bytes under the
+session workspace `uploads/` directory (same shared helper and 10 MB limit as
+ACP inbound `resource.blob`) and replaces the model-facing tool output with
+non-blob provenance text plus a `[Document: …]` or `[IMAGE:…]` marker. This is
+gated by content shape, not by tool name. Materialization does not auto-deliver
+the file to ACP clients; the agent still calls `deliver_file` when outbound
+delivery is needed. See [ACP `session/prompt` blob intake](../channels/acp.md#sessionprompt).
+
+The two other binary MCP content shapes are mapped as follows. A `type: "image"`
+item (base64 `data` + `mimeType`) is materialized the same way and its content
+item is rewritten to a text item carrying the `[IMAGE:<path>]` marker, which the
+multimodal pipeline lifts into a native provider image part; the item's
+`annotations`/`_meta` and other non-binary fields are preserved. Only the raster
+formats the vision pipeline accepts are materialized: PNG, JPEG, WebP, and GIF.
+The on-disk extension is derived from the declared `mimeType` (canonicalized to
+its case-insensitive essence, parameters dropped) when it names one of those
+types, otherwise from sniffing the decoded bytes; the extension must match the
+bytes because the loader prefers a path's extension over its magic. An image
+whose type is neither a supported declared type nor a recognized supported
+signature degrades to `[attachment unavailable: …]` and is not written. A
+`type: "audio"` item is **not** materialized in this path, because no provider
+resolves an audio path into content parts today, so its `data` is stripped to a
+non-materializing `[audio attachment: <mime>]` placeholder. In every case the raw base64 never
+reaches the model, including for a malformed image/audio item whose `data` is
+empty or not a string.
+
+Because the result comes from an untrusted server, two per-call bounds are
+enforced before any payload is decoded, hashed, or written: at most **64**
+materializable binary items (resource blobs plus valid image items) per
+`tools/call` result, and an estimated aggregate decoded size of at most **10 MiB**
+across all of them. A result that exceeds either bound has every such item
+degraded to an `[attachment unavailable: …]` marker and writes nothing to disk,
+so an array of many empty or tiny items cannot force per-item work. Each
+individual payload is still bounded by the same 10 MB per-file limit.
+
+Separate from these *decoded* budgets, each HTTP/SSE MCP server also has a
+transport-level response-body cap, `max_response_bytes`, enforced on the raw
+*encoded* wire bytes before the body is parsed so a server cannot force an
+unbounded read. It is not the 10 MiB decoded limit above: it defaults to
+**16,078,168 bytes**, the base64 expansion of the 10 MiB decoded aggregate plus
+JSON-RPC envelope headroom, so a valid near-limit blob still reaches
+materialization. Set `max_response_bytes` on a server to override it; `0` or
+leaving it unset uses that default.
+
+### Security
+
+Resource and prompt content originates from the configured MCP server and is
+treated as **untrusted**: it is provenance-wrapped, secret-scrubbed, and
+length-bounded before entering context. Access to `mcp_resources` / `mcp_prompts`
+and to specific servers is governed by your agent's tool access policy (risk
+profile), and narrows correctly when delegating to subagents.

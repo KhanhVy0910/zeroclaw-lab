@@ -1,0 +1,165 @@
+use std::sync::Arc;
+
+use crossterm::event::{KeyEvent, MouseEvent};
+use ratatui::layout::Rect;
+
+use crate::chat;
+use crate::client::RpcClient;
+
+/// ACP pane — displayed as "Code" in the UI; internal name kept for historical reasons.
+pub(crate) struct Acp {
+    inner: chat::Chat,
+}
+
+impl Acp {
+    pub(crate) fn new(rpc: Arc<RpcClient>) -> Self {
+        Self {
+            inner: chat::Chat::new(rpc, chat::PaneKind::Acp),
+        }
+    }
+
+    pub(crate) async fn init(&mut self) -> anyhow::Result<()> {
+        self.inner.init().await
+    }
+
+    pub(crate) fn set_resume_sessions(&mut self, entries: Vec<chat::ResumeEntry>) {
+        self.inner.set_resume_sessions(entries);
+    }
+
+    pub(crate) fn resume_entries(&self) -> Vec<chat::ResumeEntry> {
+        self.inner.resume_entries()
+    }
+
+    pub(crate) fn commit_reconnect_handoff(&mut self) {
+        self.inner.commit_reconnect_handoff();
+    }
+
+    pub(crate) fn session_summaries(&self) -> Vec<chat::SidebarSessionSummary> {
+        self.inner.session_summaries()
+    }
+
+    pub(crate) fn owns_session(&self, session_id: &str) -> bool {
+        self.inner.owns_session(session_id)
+    }
+
+    pub(crate) fn try_install_elicitation(
+        &mut self,
+        request: crate::client::RpcInboundRequest,
+    ) -> chat::ElicitationRouting {
+        self.inner.try_install_elicitation(request)
+    }
+
+    pub(crate) fn note_elicitation_drop(&mut self) {
+        self.inner.note_elicitation_drop();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn activate_session_for_test(&mut self, session_id: &str) {
+        self.inner.activate_session_for_test(session_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_transcript_drag_for_test(&mut self, move_pointer: bool) {
+        self.inner.begin_transcript_drag_for_test(move_pointer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transcript_selected_text_for_test(&self) -> Option<String> {
+        self.inner.transcript_selected_text_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_elicitation_for_test(&self) -> bool {
+        self.inner.has_pending_elicitation_for_test()
+    }
+
+    pub(crate) async fn focus_session(&mut self, session_id: &str) -> bool {
+        self.inner.focus_session(session_id).await
+    }
+
+    pub(crate) fn finish_transcript_drag_if_released(&mut self, mouse: &MouseEvent) {
+        self.inner.finish_transcript_drag_if_released(mouse);
+    }
+
+    pub(crate) async fn add_agent_session(&mut self, agent_alias: &str) {
+        self.inner.add_agent_session(agent_alias).await;
+    }
+
+    pub(crate) async fn close_session(&mut self, session_id: &str) -> bool {
+        self.inner.close_session(session_id).await
+    }
+
+    pub(crate) async fn refresh_if_inactive(&mut self) {
+        self.inner.refresh_if_inactive().await;
+    }
+
+    pub(crate) fn tick_transport_events(&mut self) {
+        self.inner.tick_transport_events();
+    }
+
+    pub(crate) fn draw(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        self.inner.draw(frame, area);
+    }
+
+    pub(crate) async fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        term: &mut crate::config_manager::Term,
+    ) -> bool {
+        self.inner.handle_key(key, term).await
+    }
+
+    pub(crate) fn wants_text_input(&self) -> bool {
+        self.inner.wants_text_input()
+    }
+
+    pub(crate) fn claims_pane_navigation(&self, key: &KeyEvent) -> bool {
+        self.inner.claims_pane_navigation(key)
+    }
+
+    pub(crate) fn clear_input(&mut self) {
+        self.inner.clear_input();
+    }
+
+    pub(crate) fn in_browse_mode(&self) -> bool {
+        self.inner.in_browse_mode()
+    }
+
+    pub(crate) fn wants_quit_chord(&self) -> bool {
+        self.inner.wants_quit_chord()
+    }
+
+    pub(crate) fn take_help_request(&mut self) -> bool {
+        self.inner.take_help_request()
+    }
+
+    pub(crate) fn exit_browse_mode(&mut self) {
+        self.inner.exit_browse_mode();
+    }
+
+    pub(crate) async fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+        self.inner.handle_mouse(mouse, area).await;
+    }
+
+    pub(crate) fn handle_paste(&mut self, text: &str) {
+        self.inner.handle_paste(text);
+    }
+
+    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>) {
+        self.inner.ctx_tokens()
+    }
+
+    pub(crate) fn selected_agent(&self) -> Option<&str> {
+        self.inner.selected_agent()
+    }
+
+    pub(crate) fn current_cwd(&self) -> Option<&str> {
+        self.inner.current_cwd()
+    }
+}
+
+impl crate::widgets::HelpContext for Acp {
+    fn help_context(&self) -> crate::widgets::HelpNode {
+        self.inner.help_context()
+    }
+}

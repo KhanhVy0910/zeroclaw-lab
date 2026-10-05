@@ -1,7 +1,8 @@
 [build]
-target = "riscv32imc-esp-espidf"
+target = "xtensa-esp32-espidf"
+target-dir = "C:/esp32-target"
 
-[target.riscv32imc-esp-espidf]
+[target.xtensa-esp32-espidf]
 linker = "ldproxy"
 runner = "espflash flash --monitor"
 # ESP-IDF 5.x uses 64-bit time_t

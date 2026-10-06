@@ -8,5 +8,8 @@ runner = "espflash flash --monitor"
 # ESP-IDF 5.x uses 64-bit time_t
 rustflags = ["-C", "default-linker-libraries", "--cfg", "espidf_time64"]
 
+[env]
+ESP_IDF_SDKCONFIG_DEFAULTS = { value = "sdkconfig.defaults", relative = true }
+
 [unstable]
 build-std = ["std", "panic_abort"]

@@ -24,12 +24,20 @@ use embedded_svc::wifi::{
     AccessPointConfiguration,
     AuthMethod,
 };
+use embedded_svc::io::Write;
+use std::sync::{Arc, Mutex};
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::gpio::PinDriver;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::hal::uart::{UartConfig, UartDriver};
 use esp_idf_svc::hal::units::Hertz;
+
+use esp_idf_svc::http::server::{
+    Configuration as HttpServerConfiguration,
+    EspHttpServer,
+};
+
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::{BlockingWifi, EspWifi};
 
@@ -46,7 +54,7 @@ use zeroclaw_fw_protocol::{copy_id, write_err, write_ok, Command};
 const WIFI_SSID: &str = "Zeroclaw-ESP32";
 const WIFI_PASSWORD: &str = "zeroclaw123";
 const WIFI_CHANNEL: u8 = 6;
-
+const HTTP_PORT: u16 = 80;
 
 // ============================================================
 // GPIO capabilities
@@ -79,8 +87,13 @@ fn main() -> anyhow::Result<()> {
     // --------------------------------------------------------
 
     // GPIO2 and GPIO13 are currently used as outputs.
-    let mut gpio2 = PinDriver::output(pins.gpio2)?;
-    let mut gpio13 = PinDriver::output(pins.gpio13)?;
+    let gpio2 = Arc::new(Mutex::new(
+    PinDriver::output(pins.gpio2)?
+));
+
+let gpio13 = Arc::new(Mutex::new(
+    PinDriver::output(pins.gpio13)?
+));
 
     // --------------------------------------------------------
     // UART0
@@ -129,6 +142,11 @@ fn main() -> anyhow::Result<()> {
 
     start_wifi_ap(&mut wifi)?;
 
+    let gpio2_http = Arc::clone(&gpio2);
+    let gpio13_http = Arc::clone(&gpio13);
+
+    let _http_server = start_http_server(gpio2_http, gpio13_http)?;
+
     // --------------------------------------------------------
     // Wi-Fi successfully started
     // --------------------------------------------------------
@@ -160,11 +178,14 @@ fn main() -> anyhow::Result<()> {
                 for &b in &buf[..n] {
                     if b == b'\n' {
                         if !line.is_empty() {
+                            let mut gpio2_guard = gpio2.lock().unwrap();
+                            let mut gpio13_guard = gpio13.lock().unwrap();
+
                             handle_request(
                                 &line,
-                                &mut gpio2,
-                                &mut gpio13,
-                                &mut resp_buf,
+                                &mut *gpio2_guard,
+                                &mut *gpio13_guard,
+                                 &mut resp_buf,
                             );
 
                             let _ = uart.write(resp_buf.as_bytes());
@@ -230,7 +251,204 @@ fn start_wifi_ap(
 
     Ok(())
 }
+// ============================================================
+// HTTP server
+// ============================================================
+ 
+fn start_http_server<G2, G13>(
+    gpio2: Arc<Mutex<PinDriver<'static, G2>>>,
+    gpio13: Arc<Mutex<PinDriver<'static, G13>>>,
+) -> anyhow::Result<EspHttpServer<'static>>
+where
+    G2: esp_idf_svc::hal::gpio::OutputMode + Send + 'static,
+    G13: esp_idf_svc::hal::gpio::OutputMode + Send + 'static,
+{
+    info!("Starting HTTP server...");
 
+    let server_config = HttpServerConfiguration {
+        http_port: HTTP_PORT,
+        ..Default::default()
+    };
+
+    let mut server = EspHttpServer::new(&server_config)?;
+
+    // --------------------------------------------------------
+    // GET /status
+    // --------------------------------------------------------
+
+    server.fn_handler(
+        "/status",
+        embedded_svc::http::Method::Get,
+        |request| {
+            let body = r#"{
+  "status": "ok",
+  "device": "esp32-classic"
+}"#;
+
+            let mut response = request.into_ok_response()?;
+            response.write_all(body.as_bytes())?;
+
+            Ok::<(), anyhow::Error>(())
+        },
+    )?;
+
+    // --------------------------------------------------------
+    // POST /gpio/write
+    // --------------------------------------------------------
+
+    let gpio2_http = Arc::clone(&gpio2);
+    let gpio13_http = Arc::clone(&gpio13);
+
+    server.fn_handler(
+        "/gpio/write",
+        embedded_svc::http::Method::Post,
+        move |mut request| {
+            let mut body = [0u8; 128];
+            let mut total = 0usize;
+
+            loop {
+                if total >= body.len() {
+                    anyhow::bail!("Request body too large");
+                }
+
+                let read_len = request.read(&mut body[total..])?;
+
+                if read_len == 0 {
+                    break;
+                }
+
+                total += read_len;
+            }
+
+            let body_str =
+                core::str::from_utf8(&body[..total])
+                    .map_err(|_| anyhow::anyhow!("Invalid UTF-8"))?;
+
+            info!("GPIO HTTP body: {}", body_str);
+
+            let pin = parse_json_i32(body_str, "pin")
+                .ok_or_else(|| anyhow::anyhow!("Missing pin"))?;
+
+            let value = parse_json_i32(body_str, "value")
+                .ok_or_else(|| anyhow::anyhow!("Missing value"))?;
+
+            if value != 0 && value != 1 {
+                anyhow::bail!("value must be 0 or 1");
+            }
+
+            match pin {
+                2 => {
+                    let mut gpio = gpio2_http
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("GPIO2 lock failed"))?;
+
+                    gpio.set_level(
+                        esp_idf_svc::hal::gpio::Level::from(value != 0)
+                    )?;
+                }
+
+                13 => {
+                    let mut gpio = gpio13_http
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("GPIO13 lock failed"))?;
+
+                    gpio.set_level(
+                        esp_idf_svc::hal::gpio::Level::from(value != 0)
+                    )?;
+                }
+
+                _ => {
+                    let mut response = request.into_response(
+                        400,
+                        Some("Bad Request"),
+                        &[("Content-Type", "application/json")],
+                    )?;
+
+                    response.write_all(
+                        br#"{"status":"error","message":"Unsupported GPIO pin"}"#,
+                    )?;
+
+                    return Ok::<(), anyhow::Error>(());
+                }
+            }
+
+            let mut response = request.into_ok_response()?;
+
+            let mut result = String::<128>::new();
+
+            let _ = core::fmt::Write::write_fmt(
+                &mut result,
+                format_args!(
+                    r#"{{"status":"ok","pin":{},"value":{}}}"#,
+                    pin,
+                    value
+                ),
+            );
+
+            response.write_all(result.as_bytes())?;
+
+            Ok::<(), anyhow::Error>(())
+        },
+    )?;
+
+    info!("HTTP server started");
+    info!("GET /status registered");
+    info!("POST /gpio/write registered");
+
+    Ok(server)
+}
+//=========================================
+// prase json 
+fn parse_json_i32(body: &str, key: &str) -> Option<i32> {
+    // Support both:
+    // {"pin":2,"value":1}
+    // {pin:2,value:1}
+    //
+    // Lightweight parser for the ESP32 HTTP API.
+
+    let quoted_key = {
+        let mut pattern = String::<32>::new();
+
+        let _ = core::fmt::Write::write_fmt(
+            &mut pattern,
+            format_args!(r#""{}""#, key),
+        );
+
+        pattern
+    };
+
+    let (key_pos, key_len) =
+        if let Some(pos) = body.find(quoted_key.as_str()) {
+            (pos, quoted_key.len())
+        } else if let Some(pos) = body.find(key) {
+            (pos, key.len())
+        } else {
+            return None;
+        };
+
+    let after_key = &body[key_pos + key_len..];
+
+    let colon_pos = after_key.find(':')?;
+
+    let value_part =
+        after_key[colon_pos + 1..].trim_start();
+
+    let mut end = 0;
+
+    for (i, ch) in value_part.char_indices() {
+        if !(ch.is_ascii_digit() || (i == 0 && ch == '-')) {
+            break;
+        }
+
+        end = i + ch.len_utf8();
+    }
+
+    if end == 0 {
+        return None;
+    }
+
+    value_part[..end].parse::<i32>().ok()
+}
 
 // ============================================================
 // UART command handling

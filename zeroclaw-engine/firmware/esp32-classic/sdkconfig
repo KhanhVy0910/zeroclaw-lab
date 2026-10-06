@@ -1,4 +1,5 @@
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=20000
+# Custom partition table
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="E:/gateway/zeroclaw-lab/zeroclaw-engine/firmware/esp32-classic/partitions.csv"
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
